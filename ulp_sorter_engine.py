@@ -287,7 +287,9 @@ def build_match_plan(
     port_regex = None
     if port_lookup:
         alternates = b"|".join(re.escape(part) for part in sorted(port_lookup.keys(), key=len, reverse=True))
-        port_regex = re.compile(rb"(?<!\d):(" + alternates + rb")(?!\d)")
+        # Match port numbers in common forms without matching embedded digits.
+        # Examples that match: ":22", " port=22", " 22 ", "=587", etc.
+        port_regex = re.compile(rb"(?:^|[:=\s])(" + alternates + rb")(?!\d)")
 
     return MatchPlan(
         specs=tuple(specs),
