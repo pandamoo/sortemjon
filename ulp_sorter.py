@@ -327,6 +327,11 @@ if TK_AVAILABLE:
             output_dir = payload.get("output_dir")
             snapshot = self.current_stats.snapshot() if self.current_stats is not None else {}
             errors = snapshot.get("errors", [])
+            skipped_not_saved = snapshot.get("skipped_not_saved", 0)
+            skipped_local_ip = snapshot.get("skipped_local_ip", 0)
+            oversized = snapshot.get("skipped_oversized_lines", 0)
+            parsed_ulp = snapshot.get("parsed_ulp_records", 0)
+            ignored_non_ulp = snapshot.get("ignored_non_ulp_lines", 0)
 
             if output_dir:
                 self.status_var.set(f"Finished. Output: {output_dir}")
@@ -337,6 +342,11 @@ if TK_AVAILABLE:
             lines = [
                 f"Files processed: {snapshot.get('processed_files', 0):,}/{snapshot.get('total_files', 0):,}",
                 f"Lines scanned: {snapshot.get('scanned_lines', 0):,}",
+                f"Parsed ULP records: {parsed_ulp:,}",
+                f"Ignored non-ULP lines: {ignored_non_ulp:,}",
+                f"Oversized lines skipped: {oversized:,}",
+                f"Skipped NOT_SAVED: {skipped_not_saved:,}",
+                f"Skipped local/private IP: {skipped_local_ip:,}",
                 f"Matched lines: {snapshot.get('matched_lines', 0):,}",
                 f"Total hits: {snapshot.get('total_hits', 0):,}",
             ]
