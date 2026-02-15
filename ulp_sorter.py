@@ -289,6 +289,9 @@ if TK_AVAILABLE:
             total_hits = snapshot.get("total_hits", 0)
             skipped_not_saved = snapshot.get("skipped_not_saved", 0)
             skipped_local_ip = snapshot.get("skipped_local_ip", 0)
+            parsed_ulp = snapshot.get("parsed_ulp_records", 0)
+            ignored_non_ulp = snapshot.get("ignored_non_ulp_lines", 0)
+            oversized = snapshot.get("skipped_oversized_lines", 0)
             elapsed = snapshot.get("elapsed_seconds", 0.000001)
 
             self.files_var.set(f"Files: {processed_files:,}/{total_files:,}")
@@ -296,6 +299,7 @@ if TK_AVAILABLE:
             self.lines_var.set(f"Lines: {scanned_lines:,}")
             self.hits_var.set(f"Hits: {total_hits:,}")
             self.skipped_var.set(
+                f"Parsed ULP: {parsed_ulp:,} | Ignored: {ignored_non_ulp:,} | Oversized: {oversized:,} | "
                 f"Skipped: {(skipped_not_saved + skipped_local_ip):,} "
                 f"(NOT_SAVED={skipped_not_saved:,}, local_ip={skipped_local_ip:,})"
             )

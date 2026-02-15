@@ -46,6 +46,9 @@ OUTPUT_PREFIX = "ulp_sorted_output_"
 _NOT_SAVED_PASSWORDS = (b"[NOT_SAVED]", b"[not_saved]")
 _LOCALHOST_HOSTS = {b"localhost", b"localhost.localdomain"}
 
+# Safety limit: prevents OOM when scanning binary files with no newlines.
+DEFAULT_MAX_LINE_BYTES = 1024 * 1024  # 1 MiB
+
 
 @dataclass(frozen=True)
 class KeywordSpec:
@@ -75,6 +78,9 @@ class ScanStats:
         self.scanned_lines = 0
         self.matched_lines = 0
         self.total_hits = 0
+        self.parsed_ulp_records = 0
+        self.ignored_non_ulp_lines = 0
+        self.skipped_oversized_lines = 0
         self.skipped_not_saved = 0
         self.skipped_local_ip = 0
         self.keyword_counts = {spec.key_id: 0 for spec in specs}
@@ -110,6 +116,14 @@ class ScanStats:
             self.skipped_not_saved += not_saved_delta
             self.skipped_local_ip += local_ip_delta
 
+    def add_ignored(self, parsed_ulp_delta: int, non_ulp_delta: int, oversized_delta: int) -> None:
+        if parsed_ulp_delta == 0 and non_ulp_delta == 0 and oversized_delta == 0:
+            return
+        with self.lock:
+            self.parsed_ulp_records += parsed_ulp_delta
+            self.ignored_non_ulp_lines += non_ulp_delta
+            self.skipped_oversized_lines += oversized_delta
+
     def mark_file_done(self) -> None:
         with self.lock:
             self.processed_files += 1
@@ -136,6 +150,9 @@ class ScanStats:
                 "scanned_lines": self.scanned_lines,
                 "matched_lines": self.matched_lines,
                 "total_hits": self.total_hits,
+                "parsed_ulp_records": self.parsed_ulp_records,
+                "ignored_non_ulp_lines": self.ignored_non_ulp_lines,
+                "skipped_oversized_lines": self.skipped_oversized_lines,
                 "skipped_not_saved": self.skipped_not_saved,
                 "skipped_local_ip": self.skipped_local_ip,
                 "keyword_counts": dict(self.keyword_counts),
@@ -271,11 +288,13 @@ def build_match_plan(
         key_id = f"subdomains:{stem}"
         spec = KeywordSpec(key_id=key_id, category="subdomains", label=keyword, output_file=f"{stem}.txt")
         specs.append(spec)
-        # Most subdomain patterns are like "mail.*" => match host prefix "mail."
+        # Most subdomain patterns are like "mail.*" => match host label boundary:
+        # - "mail" or "mail.example.com"
+        # (not "mailbox.example.com")
         if cleaned.endswith(".*") and cleaned.count("*") == 1:
-            token = cleaned[:-1]  # keep trailing dot, drop '*'
-            if token:
-                sub_prefix_pairs.append((key_id, token.encode("utf-8", errors="ignore")))
+            base = cleaned[:-2].strip().strip(".")
+            if base:
+                sub_prefix_pairs.append((key_id, base.encode("utf-8", errors="ignore")))
         else:
             token = cleaned.replace("*", "").strip()
             if token:
@@ -405,6 +424,7 @@ def process_file(
     stop_event: threading.Event,
     flush_threshold_bytes: int = 2 * 1024 * 1024,
     progress_interval_bytes: int = 8 * 1024 * 1024,
+    max_line_bytes: int = DEFAULT_MAX_LINE_BYTES,
 ) -> None:
     buffers: dict[str, bytearray] = defaultdict(bytearray)
     keyword_counts: dict[str, int] = defaultdict(int)
@@ -420,12 +440,31 @@ def process_file(
     port_lookup = match_plan.port_lookup
     skipped_not_saved_delta = 0
     skipped_local_ip_delta = 0
+    parsed_ulp_delta = 0
+    ignored_non_ulp_delta = 0
+    oversized_lines_delta = 0
 
     try:
         with open(file_path, "rb", buffering=4 * 1024 * 1024) as handle:
-            for raw_line in handle:
+            # Use bounded readline to avoid OOM on binary files with no newlines.
+            while True:
                 if stop_event.is_set():
                     break
+                raw_line = handle.readline(max_line_bytes + 1)
+                if not raw_line:
+                    break
+
+                if len(raw_line) > max_line_bytes:
+                    oversized_lines_delta += 1
+                    # Count the bytes we already read; then drain until newline/EOF.
+                    scanned_bytes_delta += len(raw_line)
+                    scanned_lines_delta += 1
+                    while raw_line and raw_line[-1] != 10 and not stop_event.is_set():
+                        raw_line = handle.readline(max_line_bytes + 1)
+                        if not raw_line:
+                            break
+                        scanned_bytes_delta += len(raw_line)
+                    continue
 
                 line_size = len(raw_line)
                 scanned_bytes_delta += line_size
@@ -437,14 +476,17 @@ def process_file(
                 if end and raw_line[end - 1] == 13:  # \r
                     end -= 1
                 if end <= 0:
+                    ignored_non_ulp_delta += 1
                     continue
 
                 # Parse ULP structure: url(:port)(/path):user:pass  (port/path optional)
                 last_colon = raw_line.rfind(b":", 0, end)
                 if last_colon == -1:
+                    ignored_non_ulp_delta += 1
                     continue
                 second_last_colon = raw_line.rfind(b":", 0, last_colon)
                 if second_last_colon == -1:
+                    ignored_non_ulp_delta += 1
                     continue
 
                 # Password field (skip [NOT_SAVED])
@@ -452,10 +494,13 @@ def process_file(
                 p_end = end
                 while p_start < p_end and raw_line[p_start] <= 32:
                     p_start += 1
-                while p_end > p_start and raw_line[p_end - 1] <= 32:
-                    p_end -= 1
-                if p_end - p_start in (11, 10, 12):  # cheap pre-check to avoid slice work in common cases
-                    if raw_line[p_start:p_end] in _NOT_SAVED_PASSWORDS:
+                # Only consider the first token of the password field (ignore trailing metadata).
+                p_token_end = p_start
+                while p_token_end < p_end and raw_line[p_token_end] > 32:
+                    p_token_end += 1
+                if p_token_end - p_start == 11 and raw_line[p_start] == 91 and raw_line[p_token_end - 1] == 93:  # [...]
+                    pw_token = raw_line[p_start:p_token_end]
+                    if pw_token in _NOT_SAVED_PASSWORDS or pw_token.upper() == b"[NOT_SAVED]":
                         skipped_not_saved_delta += 1
                         continue
 
@@ -467,8 +512,16 @@ def process_file(
                 while u_end > u_start and raw_line[u_end - 1] <= 32:
                     u_end -= 1
                 if u_end <= u_start:
+                    ignored_non_ulp_delta += 1
                     continue
-                user_lower = raw_line[u_start:u_end].lower()
+                # Only take the first token of username (ignore trailing metadata).
+                u_token_end = u_start
+                while u_token_end < u_end and raw_line[u_token_end] > 32:
+                    u_token_end += 1
+                if u_token_end <= u_start:
+                    ignored_non_ulp_delta += 1
+                    continue
+                user_lower = raw_line[u_start:u_token_end].lower()
 
                 # URL field
                 url_start = 0
@@ -478,6 +531,7 @@ def process_file(
                 while url_end > url_start and raw_line[url_end - 1] <= 32:
                     url_end -= 1
                 if url_end <= url_start:
+                    ignored_non_ulp_delta += 1
                     continue
 
                 scheme = raw_line.find(b"://", url_start, url_end)
@@ -500,6 +554,7 @@ def process_file(
                 while hostport_end > hostport_start and raw_line[hostport_end - 1] <= 32:
                     hostport_end -= 1
                 if hostport_end <= hostport_start:
+                    ignored_non_ulp_delta += 1
                     continue
 
                 port_bytes: Optional[bytes] = None
@@ -549,8 +604,11 @@ def process_file(
                     while h_end > h_start and raw_line[h_end - 1] == 46:  # '.'
                         h_end -= 1
                     if h_end <= h_start:
+                        ignored_non_ulp_delta += 1
                         continue
                     host_lower = raw_line[h_start:h_end].lower()
+
+                parsed_ulp_delta += 1
 
                 if is_local_ip_or_host(host_lower):
                     skipped_local_ip_delta += 1
@@ -559,7 +617,8 @@ def process_file(
                 matched_keys: list[str] = []
 
                 for key_id, prefix in sub_prefixes:
-                    if host_lower.startswith(prefix):
+                    # "mail.*" should match "mail" and "mail.example.com", but not "mailbox.example.com"
+                    if host_lower == prefix or host_lower.startswith(prefix + b"."):
                         matched_keys.append(key_id)
 
                 for key_id, token in sub_contains:
@@ -591,20 +650,28 @@ def process_file(
                     output_manager.write_batch(buffers)
                     stats.add_matches(dict(keyword_counts), matched_lines_delta)
                     stats.add_skips(skipped_not_saved_delta, skipped_local_ip_delta)
+                    stats.add_ignored(parsed_ulp_delta, ignored_non_ulp_delta, oversized_lines_delta)
                     buffers.clear()
                     keyword_counts.clear()
                     buffered_output_bytes = 0
                     matched_lines_delta = 0
                     skipped_not_saved_delta = 0
                     skipped_local_ip_delta = 0
+                    parsed_ulp_delta = 0
+                    ignored_non_ulp_delta = 0
+                    oversized_lines_delta = 0
 
                 if scanned_bytes_delta >= progress_interval_bytes:
                     stats.add_scan(scanned_bytes_delta, scanned_lines_delta)
                     stats.add_skips(skipped_not_saved_delta, skipped_local_ip_delta)
+                    stats.add_ignored(parsed_ulp_delta, ignored_non_ulp_delta, oversized_lines_delta)
                     scanned_bytes_delta = 0
                     scanned_lines_delta = 0
                     skipped_not_saved_delta = 0
                     skipped_local_ip_delta = 0
+                    parsed_ulp_delta = 0
+                    ignored_non_ulp_delta = 0
+                    oversized_lines_delta = 0
     finally:
         if buffers:
             output_manager.write_batch(buffers)
@@ -612,6 +679,8 @@ def process_file(
             stats.add_matches(dict(keyword_counts), matched_lines_delta)
         if skipped_not_saved_delta or skipped_local_ip_delta:
             stats.add_skips(skipped_not_saved_delta, skipped_local_ip_delta)
+        if parsed_ulp_delta or ignored_non_ulp_delta or oversized_lines_delta:
+            stats.add_ignored(parsed_ulp_delta, ignored_non_ulp_delta, oversized_lines_delta)
         if scanned_bytes_delta or scanned_lines_delta:
             stats.add_scan(scanned_bytes_delta, scanned_lines_delta)
         stats.mark_file_done()
@@ -644,7 +713,11 @@ def write_summary_file(output_dir: Path, snapshot: dict, plan: MatchPlan, cancel
         f"cancelled: {'yes' if cancelled else 'no'}",
         f"files_processed: {snapshot['processed_files']}/{snapshot['total_files']}",
         f"bytes_scanned: {snapshot['scanned_bytes']}",
+        f"bytes_scanned_human: {format_bytes(snapshot['scanned_bytes'])}",
         f"lines_scanned: {snapshot['scanned_lines']}",
+        f"parsed_ulp_records: {snapshot.get('parsed_ulp_records', 0)}",
+        f"ignored_non_ulp_lines: {snapshot.get('ignored_non_ulp_lines', 0)}",
+        f"skipped_oversized_lines: {snapshot.get('skipped_oversized_lines', 0)}",
         f"skipped_not_saved: {snapshot.get('skipped_not_saved', 0)}",
         f"skipped_local_ip: {snapshot.get('skipped_local_ip', 0)}",
         f"matched_lines: {snapshot['matched_lines']}",
