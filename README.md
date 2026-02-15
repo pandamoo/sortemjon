@@ -10,6 +10,9 @@ Fast desktop log sorter for large ULP-style log datasets.
   - **Paths**
   - **Ports**
   - **Usernames**
+- Skips saving entries when:
+  - password is exactly **`[NOT_SAVED]`**
+  - host is a **local/private IP** (e.g. `10.x.x.x`, `192.168.x.x`, `127.x.x.x`, `172.16-31.x.x`)
 - Uses your requested base keyword set by default
 - Lets you add custom keywords per category
 - Writes matches to **separate files per keyword** in real time

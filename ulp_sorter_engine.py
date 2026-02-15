@@ -43,6 +43,9 @@ DEFAULT_USERNAMES = ("admin",)
 
 OUTPUT_PREFIX = "ulp_sorted_output_"
 
+_NOT_SAVED_PASSWORDS = (b"[NOT_SAVED]", b"[not_saved]")
+_LOCALHOST_HOSTS = {b"localhost", b"localhost.localdomain"}
+
 
 @dataclass(frozen=True)
 class KeywordSpec:
@@ -55,10 +58,10 @@ class KeywordSpec:
 @dataclass(frozen=True)
 class MatchPlan:
     specs: tuple[KeywordSpec, ...]
-    subdomain_pairs: tuple[tuple[str, bytes], ...]
+    subdomain_prefix_pairs: tuple[tuple[str, bytes], ...]
+    subdomain_contains_pairs: tuple[tuple[str, bytes], ...]
     path_pairs: tuple[tuple[str, bytes], ...]
     username_pairs: tuple[tuple[str, bytes], ...]
-    port_regex: Optional[re.Pattern[bytes]]
     port_lookup: dict[bytes, str]
 
 
@@ -72,6 +75,8 @@ class ScanStats:
         self.scanned_lines = 0
         self.matched_lines = 0
         self.total_hits = 0
+        self.skipped_not_saved = 0
+        self.skipped_local_ip = 0
         self.keyword_counts = {spec.key_id: 0 for spec in specs}
         self.errors: list[str] = []
         self.started_at = time.time()
@@ -97,6 +102,13 @@ class ScanStats:
                 self.keyword_counts[key_id] = self.keyword_counts.get(key_id, 0) + amount
                 self.total_hits += amount
             self.matched_lines += matched_lines_delta
+
+    def add_skips(self, not_saved_delta: int, local_ip_delta: int) -> None:
+        if not_saved_delta == 0 and local_ip_delta == 0:
+            return
+        with self.lock:
+            self.skipped_not_saved += not_saved_delta
+            self.skipped_local_ip += local_ip_delta
 
     def mark_file_done(self) -> None:
         with self.lock:
@@ -124,6 +136,8 @@ class ScanStats:
                 "scanned_lines": self.scanned_lines,
                 "matched_lines": self.matched_lines,
                 "total_hits": self.total_hits,
+                "skipped_not_saved": self.skipped_not_saved,
+                "skipped_local_ip": self.skipped_local_ip,
                 "keyword_counts": dict(self.keyword_counts),
                 "errors": list(self.errors),
                 "started_at": self.started_at,
@@ -239,7 +253,8 @@ def build_match_plan(
     )
 
     specs: list[KeywordSpec] = []
-    sub_pairs: list[tuple[str, bytes]] = []
+    sub_prefix_pairs: list[tuple[str, bytes]] = []
+    sub_contains_pairs: list[tuple[str, bytes]] = []
     path_pairs: list[tuple[str, bytes]] = []
     user_pairs: list[tuple[str, bytes]] = []
     port_lookup: dict[bytes, str] = {}
@@ -249,14 +264,22 @@ def build_match_plan(
     used_users: set[str] = set()
 
     for keyword in subdomains:
-        token = keyword.replace("*", "").strip()
-        if not token:
+        cleaned = keyword.strip()
+        if not cleaned:
             continue
         stem = unique_name(slugify(keyword), used_sub)
         key_id = f"subdomains:{stem}"
         spec = KeywordSpec(key_id=key_id, category="subdomains", label=keyword, output_file=f"{stem}.txt")
         specs.append(spec)
-        sub_pairs.append((key_id, token.encode("utf-8", errors="ignore")))
+        # Most subdomain patterns are like "mail.*" => match host prefix "mail."
+        if cleaned.endswith(".*") and cleaned.count("*") == 1:
+            token = cleaned[:-1]  # keep trailing dot, drop '*'
+            if token:
+                sub_prefix_pairs.append((key_id, token.encode("utf-8", errors="ignore")))
+        else:
+            token = cleaned.replace("*", "").strip()
+            if token:
+                sub_contains_pairs.append((key_id, token.encode("utf-8", errors="ignore")))
 
     for keyword in paths:
         if not keyword:
@@ -284,19 +307,12 @@ def build_match_plan(
         specs.append(spec)
         user_pairs.append((key_id, username.encode("utf-8", errors="ignore")))
 
-    port_regex = None
-    if port_lookup:
-        alternates = b"|".join(re.escape(part) for part in sorted(port_lookup.keys(), key=len, reverse=True))
-        # Match port numbers in common forms without matching embedded digits.
-        # Examples that match: ":22", " port=22", " 22 ", "=587", etc.
-        port_regex = re.compile(rb"(?:^|[:=\s])(" + alternates + rb")(?!\d)")
-
     return MatchPlan(
         specs=tuple(specs),
-        subdomain_pairs=tuple(sub_pairs),
+        subdomain_prefix_pairs=tuple(sub_prefix_pairs),
+        subdomain_contains_pairs=tuple(sub_contains_pairs),
         path_pairs=tuple(path_pairs),
         username_pairs=tuple(user_pairs),
-        port_regex=port_regex,
         port_lookup=port_lookup,
     )
 
@@ -327,6 +343,60 @@ def discover_files(root_dir: Path) -> list[tuple[str, int]]:
     return files
 
 
+def is_local_ip_or_host(host_lower: bytes) -> bool:
+    # Local hostnames
+    if not host_lower:
+        return False
+    if host_lower in _LOCALHOST_HOSTS:
+        return True
+
+    # IPv4 fast-path (common in logs)
+    first = host_lower[0]
+    if 48 <= first <= 57 and host_lower.count(b".") == 3:
+        parts = host_lower.split(b".")
+        if len(parts) == 4:
+            try:
+                a = int(parts[0])
+                b = int(parts[1])
+                c = int(parts[2])
+                d = int(parts[3])
+            except ValueError:
+                return False
+            if not (0 <= a <= 255 and 0 <= b <= 255 and 0 <= c <= 255 and 0 <= d <= 255):
+                return False
+            # RFC1918 / local / loopback / link-local / CGNAT
+            if a in (0, 10, 127):
+                return True
+            if a == 169 and b == 254:
+                return True
+            if a == 172 and 16 <= b <= 31:
+                return True
+            if a == 192 and b == 168:
+                return True
+            if a == 100 and 64 <= b <= 127:
+                return True
+        return False
+
+    # IPv6 (rare). Only attempt parsing when ':' is present.
+    if b":" in host_lower:
+        try:
+            import ipaddress
+
+            ip = ipaddress.ip_address(host_lower.decode("ascii", errors="ignore"))
+        except Exception:
+            return False
+        return (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        )
+
+    return False
+
+
 def process_file(
     file_path: str,
     match_plan: MatchPlan,
@@ -343,11 +413,13 @@ def process_file(
     scanned_bytes_delta = 0
     scanned_lines_delta = 0
 
-    subdomains = match_plan.subdomain_pairs
+    sub_prefixes = match_plan.subdomain_prefix_pairs
+    sub_contains = match_plan.subdomain_contains_pairs
     paths = match_plan.path_pairs
     usernames = match_plan.username_pairs
-    port_regex = match_plan.port_regex
     port_lookup = match_plan.port_lookup
+    skipped_not_saved_delta = 0
+    skipped_local_ip_delta = 0
 
     try:
         with open(file_path, "rb", buffering=4 * 1024 * 1024) as handle:
@@ -358,28 +430,155 @@ def process_file(
                 line_size = len(raw_line)
                 scanned_bytes_delta += line_size
                 scanned_lines_delta += 1
-                lower_line = raw_line.lower()
+                # Trim newline (keep raw_line for output writes).
+                end = line_size
+                if end and raw_line[end - 1] == 10:  # \n
+                    end -= 1
+                if end and raw_line[end - 1] == 13:  # \r
+                    end -= 1
+                if end <= 0:
+                    continue
+
+                # Parse ULP structure: url(:port)(/path):user:pass  (port/path optional)
+                last_colon = raw_line.rfind(b":", 0, end)
+                if last_colon == -1:
+                    continue
+                second_last_colon = raw_line.rfind(b":", 0, last_colon)
+                if second_last_colon == -1:
+                    continue
+
+                # Password field (skip [NOT_SAVED])
+                p_start = last_colon + 1
+                p_end = end
+                while p_start < p_end and raw_line[p_start] <= 32:
+                    p_start += 1
+                while p_end > p_start and raw_line[p_end - 1] <= 32:
+                    p_end -= 1
+                if p_end - p_start in (11, 10, 12):  # cheap pre-check to avoid slice work in common cases
+                    if raw_line[p_start:p_end] in _NOT_SAVED_PASSWORDS:
+                        skipped_not_saved_delta += 1
+                        continue
+
+                # Username field
+                u_start = second_last_colon + 1
+                u_end = last_colon
+                while u_start < u_end and raw_line[u_start] <= 32:
+                    u_start += 1
+                while u_end > u_start and raw_line[u_end - 1] <= 32:
+                    u_end -= 1
+                if u_end <= u_start:
+                    continue
+                user_lower = raw_line[u_start:u_end].lower()
+
+                # URL field
+                url_start = 0
+                url_end = second_last_colon
+                while url_start < url_end and raw_line[url_start] <= 32:
+                    url_start += 1
+                while url_end > url_start and raw_line[url_end - 1] <= 32:
+                    url_end -= 1
+                if url_end <= url_start:
+                    continue
+
+                scheme = raw_line.find(b"://", url_start, url_end)
+                host_start = scheme + 3 if scheme != -1 else url_start
+                if raw_line.startswith(b"//", url_start):
+                    host_start = url_start + 2
+
+                slash = raw_line.find(b"/", host_start, url_end)
+                if slash == -1:
+                    hostport_start = host_start
+                    hostport_end = url_end
+                    path_lower = b""
+                else:
+                    hostport_start = host_start
+                    hostport_end = slash
+                    path_lower = raw_line[slash:url_end].lower()
+
+                while hostport_start < hostport_end and raw_line[hostport_start] <= 32:
+                    hostport_start += 1
+                while hostport_end > hostport_start and raw_line[hostport_end - 1] <= 32:
+                    hostport_end -= 1
+                if hostport_end <= hostport_start:
+                    continue
+
+                port_bytes: Optional[bytes] = None
+
+                if raw_line[hostport_start] == 91:  # '['
+                    bracket_end = raw_line.find(b"]", hostport_start + 1, hostport_end)
+                    if bracket_end == -1:
+                        continue
+                    host_raw = raw_line[hostport_start + 1 : bracket_end]
+                    rest_start = bracket_end + 1
+                    if rest_start < hostport_end and raw_line[rest_start] == 58:  # ':'
+                        pp_start = rest_start + 1
+                        pp_end = hostport_end
+                        while pp_start < pp_end and raw_line[pp_start] <= 32:
+                            pp_start += 1
+                        while pp_end > pp_start and raw_line[pp_end - 1] <= 32:
+                            pp_end -= 1
+                        if pp_end > pp_start:
+                            candidate = raw_line[pp_start:pp_end]
+                            if candidate.isdigit():
+                                port_bytes = candidate
+                    host_lower = host_raw.lower()
+                else:
+                    colon = raw_line.rfind(b":", hostport_start, hostport_end)
+                    if colon != -1:
+                        pp_start = colon + 1
+                        pp_end = hostport_end
+                        while pp_start < pp_end and raw_line[pp_start] <= 32:
+                            pp_start += 1
+                        while pp_end > pp_start and raw_line[pp_end - 1] <= 32:
+                            pp_end -= 1
+                        candidate = raw_line[pp_start:pp_end]
+                        if candidate.isdigit():
+                            port_bytes = candidate
+                            host_end = colon
+                        else:
+                            host_end = hostport_end
+                    else:
+                        host_end = hostport_end
+
+                    h_start = hostport_start
+                    h_end = host_end
+                    while h_start < h_end and raw_line[h_start] <= 32:
+                        h_start += 1
+                    while h_end > h_start and raw_line[h_end - 1] <= 32:
+                        h_end -= 1
+                    while h_end > h_start and raw_line[h_end - 1] == 46:  # '.'
+                        h_end -= 1
+                    if h_end <= h_start:
+                        continue
+                    host_lower = raw_line[h_start:h_end].lower()
+
+                if is_local_ip_or_host(host_lower):
+                    skipped_local_ip_delta += 1
+                    continue
+
                 matched_keys: list[str] = []
 
-                for key_id, token in subdomains:
-                    if token in lower_line:
+                for key_id, prefix in sub_prefixes:
+                    if host_lower.startswith(prefix):
                         matched_keys.append(key_id)
 
-                for key_id, token in paths:
-                    if token in lower_line:
+                for key_id, token in sub_contains:
+                    if token in host_lower:
                         matched_keys.append(key_id)
+
+                if path_lower:
+                    for key_id, token in paths:
+                        if token in path_lower:
+                            matched_keys.append(key_id)
 
                 for key_id, token in usernames:
-                    if token in lower_line:
+                    if token in user_lower:
                         matched_keys.append(key_id)
 
-                if port_regex is not None:
-                    seen_ports: set[str] = set()
-                    for match in port_regex.finditer(lower_line):
-                        key_id = port_lookup.get(match.group(1))
-                        if key_id and key_id not in seen_ports:
-                            matched_keys.append(key_id)
-                            seen_ports.add(key_id)
+                if port_bytes is not None:
+                    port_key_id = port_lookup.get(port_bytes)
+                    if port_key_id:
+                        matched_keys.append(port_key_id)
 
                 if matched_keys:
                     matched_lines_delta += 1
@@ -391,20 +590,28 @@ def process_file(
                 if buffered_output_bytes >= flush_threshold_bytes:
                     output_manager.write_batch(buffers)
                     stats.add_matches(dict(keyword_counts), matched_lines_delta)
+                    stats.add_skips(skipped_not_saved_delta, skipped_local_ip_delta)
                     buffers.clear()
                     keyword_counts.clear()
                     buffered_output_bytes = 0
                     matched_lines_delta = 0
+                    skipped_not_saved_delta = 0
+                    skipped_local_ip_delta = 0
 
                 if scanned_bytes_delta >= progress_interval_bytes:
                     stats.add_scan(scanned_bytes_delta, scanned_lines_delta)
+                    stats.add_skips(skipped_not_saved_delta, skipped_local_ip_delta)
                     scanned_bytes_delta = 0
                     scanned_lines_delta = 0
+                    skipped_not_saved_delta = 0
+                    skipped_local_ip_delta = 0
     finally:
         if buffers:
             output_manager.write_batch(buffers)
         if keyword_counts or matched_lines_delta:
             stats.add_matches(dict(keyword_counts), matched_lines_delta)
+        if skipped_not_saved_delta or skipped_local_ip_delta:
+            stats.add_skips(skipped_not_saved_delta, skipped_local_ip_delta)
         if scanned_bytes_delta or scanned_lines_delta:
             stats.add_scan(scanned_bytes_delta, scanned_lines_delta)
         stats.mark_file_done()
@@ -438,6 +645,8 @@ def write_summary_file(output_dir: Path, snapshot: dict, plan: MatchPlan, cancel
         f"files_processed: {snapshot['processed_files']}/{snapshot['total_files']}",
         f"bytes_scanned: {snapshot['scanned_bytes']}",
         f"lines_scanned: {snapshot['scanned_lines']}",
+        f"skipped_not_saved: {snapshot.get('skipped_not_saved', 0)}",
+        f"skipped_local_ip: {snapshot.get('skipped_local_ip', 0)}",
         f"matched_lines: {snapshot['matched_lines']}",
         f"total_hits: {snapshot['total_hits']}",
         "",

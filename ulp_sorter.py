@@ -38,6 +38,7 @@ if TK_AVAILABLE:
             self.bytes_var = tk.StringVar(value="Bytes: 0 B / 0 B")
             self.lines_var = tk.StringVar(value="Lines: 0")
             self.hits_var = tk.StringVar(value="Hits: 0")
+            self.skipped_var = tk.StringVar(value="Skipped: 0")
             self.speed_var = tk.StringVar(value="Speed: 0 B/s")
             self.elapsed_var = tk.StringVar(value="Elapsed: 0.0s")
 
@@ -147,6 +148,7 @@ if TK_AVAILABLE:
             ttk.Label(stats_line, textvariable=self.bytes_var).pack(side="left", padx=(0, 16))
             ttk.Label(stats_line, textvariable=self.lines_var).pack(side="left", padx=(0, 16))
             ttk.Label(stats_line, textvariable=self.hits_var).pack(side="left", padx=(0, 16))
+            ttk.Label(stats_line, textvariable=self.skipped_var).pack(side="left", padx=(0, 16))
             ttk.Label(stats_line, textvariable=self.speed_var).pack(side="left", padx=(0, 16))
             ttk.Label(stats_line, textvariable=self.elapsed_var).pack(side="left", padx=(0, 16))
 
@@ -285,12 +287,18 @@ if TK_AVAILABLE:
             scanned_bytes = snapshot.get("scanned_bytes", 0)
             scanned_lines = snapshot.get("scanned_lines", 0)
             total_hits = snapshot.get("total_hits", 0)
+            skipped_not_saved = snapshot.get("skipped_not_saved", 0)
+            skipped_local_ip = snapshot.get("skipped_local_ip", 0)
             elapsed = snapshot.get("elapsed_seconds", 0.000001)
 
             self.files_var.set(f"Files: {processed_files:,}/{total_files:,}")
             self.bytes_var.set(f"Bytes: {eng.format_bytes(scanned_bytes)} / {eng.format_bytes(total_bytes)}")
             self.lines_var.set(f"Lines: {scanned_lines:,}")
             self.hits_var.set(f"Hits: {total_hits:,}")
+            self.skipped_var.set(
+                f"Skipped: {(skipped_not_saved + skipped_local_ip):,} "
+                f"(NOT_SAVED={skipped_not_saved:,}, local_ip={skipped_local_ip:,})"
+            )
             self.speed_var.set(f"Speed: {eng.format_rate(scanned_bytes / elapsed)}")
             self.elapsed_var.set(f"Elapsed: {elapsed:.1f}s")
 
