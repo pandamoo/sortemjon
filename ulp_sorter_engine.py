@@ -4,6 +4,7 @@ import os
 import re
 import threading
 import time
+import errno
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -165,26 +166,64 @@ class ScanStats:
 
 class OutputManager:
     def __init__(self, output_root: Path, specs: tuple[KeywordSpec, ...]) -> None:
+        self._paths: dict[str, Path] = {}
         self._handles: dict[str, object] = {}
         self._locks: dict[str, threading.Lock] = {}
+        self._mode = "preopen"
+
         for spec in specs:
             category_dir = output_root / spec.category
             category_dir.mkdir(parents=True, exist_ok=True)
             output_path = category_dir / spec.output_file
-            handle = open(output_path, "ab", buffering=0)
-            self._handles[spec.key_id] = handle
+            self._paths[spec.key_id] = output_path
             self._locks[spec.key_id] = threading.Lock()
 
+        # Fast path: keep all output files open (best throughput).
+        try:
+            for key_id, output_path in self._paths.items():
+                self._handles[key_id] = open(output_path, "ab", buffering=0)
+        except OSError as exc:
+            # Production hardening: if we exceed the OS fd limit, fall back to opening
+            # per write. Slower, but avoids crashing on very large keyword sets.
+            if exc.errno == errno.EMFILE:
+                self._mode = "open_per_write"
+                for handle in self._handles.values():
+                    try:
+                        handle.close()
+                    except OSError:
+                        pass
+                self._handles.clear()
+                # Ensure files exist even if no matches are written.
+                for output_path in self._paths.values():
+                    with open(output_path, "ab", buffering=0):
+                        pass
+            else:
+                raise
+
     def write_batch(self, data: dict[str, bytearray]) -> None:
+        if self._mode == "preopen":
+            for key_id, payload in data.items():
+                if not payload:
+                    continue
+                handle = self._handles.get(key_id)
+                lock = self._locks.get(key_id)
+                if handle is None or lock is None:
+                    continue
+                with lock:
+                    handle.write(payload)
+            return
+
+        # Fallback mode (EMFILE-safe): open -> write -> close for each flush.
         for key_id, payload in data.items():
             if not payload:
                 continue
-            handle = self._handles.get(key_id)
+            output_path = self._paths.get(key_id)
             lock = self._locks.get(key_id)
-            if handle is None or lock is None:
+            if output_path is None or lock is None:
                 continue
             with lock:
-                handle.write(payload)
+                with open(output_path, "ab", buffering=0) as handle:
+                    handle.write(payload)
 
     def close(self) -> None:
         for handle in self._handles.values():
