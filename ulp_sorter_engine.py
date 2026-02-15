@@ -464,6 +464,18 @@ def process_file(
                         if not raw_line:
                             break
                         scanned_bytes_delta += len(raw_line)
+                        # Keep UI/progress responsive even when draining a huge no-newline blob.
+                        if scanned_bytes_delta >= progress_interval_bytes:
+                            stats.add_scan(scanned_bytes_delta, scanned_lines_delta)
+                            stats.add_skips(skipped_not_saved_delta, skipped_local_ip_delta)
+                            stats.add_ignored(parsed_ulp_delta, ignored_non_ulp_delta, oversized_lines_delta)
+                            scanned_bytes_delta = 0
+                            scanned_lines_delta = 0
+                            skipped_not_saved_delta = 0
+                            skipped_local_ip_delta = 0
+                            parsed_ulp_delta = 0
+                            ignored_non_ulp_delta = 0
+                            oversized_lines_delta = 0
                     continue
 
                 line_size = len(raw_line)
