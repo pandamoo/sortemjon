@@ -95,3 +95,9 @@ sudo apt-get update && sudo apt-get install -y python3-tk
 
 - `ulp_sorter.py` - Tkinter GUI (directory picker + live progress)
 - `ulp_sorter_engine.py` - fast scanner engine (no GUI dependency)
+
+## Testing
+
+```bash
+python3 -m unittest discover -s tests -p "test*.py"
+```
