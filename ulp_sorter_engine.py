@@ -552,6 +552,9 @@ def process_file(
                 if p_token_end - p_start == 11 and raw_line[p_start] == 91 and raw_line[p_token_end - 1] == 93:  # [...]
                     pw_token = raw_line[p_start:p_token_end]
                     if pw_token in _NOT_SAVED_PASSWORDS or pw_token.upper() == b"[NOT_SAVED]":
+                        # Count it as a recognized ULP record even though we skip it
+                        # before parsing the URL/host for speed.
+                        parsed_ulp_delta += 1
                         skipped_not_saved_delta += 1
                         continue
 
