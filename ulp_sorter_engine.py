@@ -5,6 +5,7 @@ import re
 import threading
 import time
 import errno
+import platform
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -50,6 +51,10 @@ _LOCALHOST_HOSTS = {b"localhost", b"localhost.localdomain"}
 # Safety limit: prevents OOM when scanning binary files with no newlines.
 DEFAULT_MAX_LINE_BYTES = 1024 * 1024  # 1 MiB
 
+# Conservative upper bound for automatic worker selection.
+# (Higher thread counts can still be chosen manually in the GUI.)
+AUTO_MAX_WORKERS_CAP = 256
+
 
 @dataclass(frozen=True)
 class KeywordSpec:
@@ -74,6 +79,10 @@ class ScanStats:
         self.lock = threading.Lock()
         self.total_files = total_files
         self.total_bytes = total_bytes
+        self.active_workers = 0
+        self.file_read_buffer_bytes = 0
+        self.flush_threshold_bytes = 0
+        self.output_mode = ""
         self.processed_files = 0
         self.scanned_bytes = 0
         self.scanned_lines = 0
@@ -93,6 +102,20 @@ class ScanStats:
         with self.lock:
             self.total_files = total_files
             self.total_bytes = total_bytes
+
+    def set_runtime_config(
+        self,
+        *,
+        active_workers: int,
+        file_read_buffer_bytes: int,
+        flush_threshold_bytes: int,
+        output_mode: str,
+    ) -> None:
+        with self.lock:
+            self.active_workers = int(active_workers)
+            self.file_read_buffer_bytes = int(file_read_buffer_bytes)
+            self.flush_threshold_bytes = int(flush_threshold_bytes)
+            self.output_mode = str(output_mode)
 
     def add_scan(self, byte_count: int, line_count: int) -> None:
         if byte_count == 0 and line_count == 0:
@@ -146,6 +169,10 @@ class ScanStats:
             return {
                 "total_files": self.total_files,
                 "total_bytes": self.total_bytes,
+                "active_workers": self.active_workers,
+                "file_read_buffer_bytes": self.file_read_buffer_bytes,
+                "flush_threshold_bytes": self.flush_threshold_bytes,
+                "output_mode": self.output_mode,
                 "processed_files": self.processed_files,
                 "scanned_bytes": self.scanned_bytes,
                 "scanned_lines": self.scanned_lines,
@@ -231,6 +258,29 @@ class OutputManager:
                 handle.close()
             except OSError:
                 pass
+
+    def downgrade_to_open_per_write(self) -> None:
+        """
+        Closes any pre-opened handles and switches to open-per-write mode.
+        Useful when the process NOFILE limit would otherwise cap worker count too hard.
+        """
+        if self._mode == "open_per_write":
+            return
+        self._mode = "open_per_write"
+        for handle in self._handles.values():
+            try:
+                handle.close()
+            except OSError:
+                pass
+        self._handles.clear()
+
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    @property
+    def open_handle_count(self) -> int:
+        return len(self._handles)
 
 
 def parse_keywords(raw_text: str) -> list[str]:
@@ -464,6 +514,7 @@ def process_file(
     flush_threshold_bytes: int = 2 * 1024 * 1024,
     progress_interval_bytes: int = 8 * 1024 * 1024,
     max_line_bytes: int = DEFAULT_MAX_LINE_BYTES,
+    file_read_buffer_bytes: int = 4 * 1024 * 1024,
 ) -> None:
     buffers: dict[str, bytearray] = defaultdict(bytearray)
     keyword_counts: dict[str, int] = defaultdict(int)
@@ -484,7 +535,7 @@ def process_file(
     oversized_lines_delta = 0
 
     try:
-        with open(file_path, "rb", buffering=4 * 1024 * 1024) as handle:
+        with open(file_path, "rb", buffering=file_read_buffer_bytes) as handle:
             # Use bounded readline to avoid OOM on binary files with no newlines.
             while True:
                 if stop_event.is_set():
@@ -668,37 +719,50 @@ def process_file(
                     skipped_local_ip_delta += 1
                     continue
 
-                matched_keys: list[str] = []
+                line_matched = False
+                buf = buffers
+                kc = keyword_counts
 
                 for key_id, prefix in sub_prefixes:
                     # "mail.*" should match "mail" and "mail.example.com", but not "mailbox.example.com"
                     if host_lower == prefix or host_lower.startswith(prefix + b"."):
-                        matched_keys.append(key_id)
+                        line_matched = True
+                        buf[key_id].extend(raw_line)
+                        kc[key_id] += 1
+                        buffered_output_bytes += line_size
 
                 for key_id, token in sub_contains:
                     if token in host_lower:
-                        matched_keys.append(key_id)
+                        line_matched = True
+                        buf[key_id].extend(raw_line)
+                        kc[key_id] += 1
+                        buffered_output_bytes += line_size
 
                 if path_lower:
                     for key_id, token in paths:
                         if token in path_lower:
-                            matched_keys.append(key_id)
+                            line_matched = True
+                            buf[key_id].extend(raw_line)
+                            kc[key_id] += 1
+                            buffered_output_bytes += line_size
 
                 for key_id, token in usernames:
                     if token in user_lower:
-                        matched_keys.append(key_id)
+                        line_matched = True
+                        buf[key_id].extend(raw_line)
+                        kc[key_id] += 1
+                        buffered_output_bytes += line_size
 
                 if port_bytes is not None:
                     port_key_id = port_lookup.get(port_bytes)
                     if port_key_id:
-                        matched_keys.append(port_key_id)
+                        line_matched = True
+                        buf[port_key_id].extend(raw_line)
+                        kc[port_key_id] += 1
+                        buffered_output_bytes += line_size
 
-                if matched_keys:
+                if line_matched:
                     matched_lines_delta += 1
-                    for key_id in matched_keys:
-                        buffers[key_id].extend(raw_line)
-                        keyword_counts[key_id] += 1
-                    buffered_output_bytes += line_size * len(matched_keys)
 
                 if buffered_output_bytes >= flush_threshold_bytes:
                     output_manager.write_batch(buffers)
@@ -756,6 +820,81 @@ def format_rate(byte_count: float) -> str:
     return f"{format_bytes(int(byte_count))}/s"
 
 
+def get_mem_available_bytes() -> Optional[int]:
+    """
+    Best-effort available memory detection for auto-tuning.
+    Returns None if the platform doesn't expose the info.
+    """
+    if platform.system().lower() != "linux":
+        return None
+    try:
+        data = Path("/proc/meminfo").read_text(encoding="ascii", errors="ignore").splitlines()
+    except OSError:
+        return None
+    for line in data:
+        if line.startswith("MemAvailable:"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                # kB
+                return int(parts[1]) * 1024
+    # Fallback to MemFree if MemAvailable isn't present (older kernels)
+    for line in data:
+        if line.startswith("MemFree:"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                return int(parts[1]) * 1024
+    return None
+
+
+def recommend_max_workers(cpu_count: Optional[int] = None, mem_available_bytes: Optional[int] = None) -> int:
+    """
+    Pick an aggressive-but-safe default worker count based on hardware.
+    The scan is primarily I/O bound, so we typically oversubscribe CPU.
+    """
+    cpu = cpu_count or (os.cpu_count() or 4)
+    mem_avail = mem_available_bytes if mem_available_bytes is not None else get_mem_available_bytes()
+
+    # Aggressive oversubscription for I/O-bound workloads.
+    target = max(4, cpu * 8)
+    target = min(AUTO_MAX_WORKERS_CAP, target)
+
+    # Memory clamp: keep per-worker budget so we don't blow RAM on big machines.
+    # Rough estimate includes: input buffer + output buffers + Python overhead.
+    if mem_avail is not None and mem_avail > 0:
+        per_worker_budget = 16 * 1024 * 1024  # 16 MiB
+        # Use at most ~35% of available memory for worker-related buffering.
+        mem_cap = max(1, int((mem_avail * 0.35) // per_worker_budget))
+        target = min(target, mem_cap)
+
+    return max(1, int(target))
+
+
+def recommend_io_buffers(
+    workers: int, mem_available_bytes: Optional[int] = None
+) -> tuple[int, int]:
+    """
+    Returns (file_read_buffer_bytes, flush_threshold_bytes).
+    """
+    w = max(1, int(workers))
+    mem_avail = mem_available_bytes if mem_available_bytes is not None else get_mem_available_bytes()
+
+    # Total budgets (best-effort).
+    if mem_avail is None or mem_avail <= 0:
+        total_read_budget = 256 * 1024 * 1024
+        total_flush_budget = 128 * 1024 * 1024
+    else:
+        total_read_budget = int(min(1024 * 1024 * 1024, max(128 * 1024 * 1024, mem_avail * 0.06)))
+        total_flush_budget = int(min(512 * 1024 * 1024, max(64 * 1024 * 1024, mem_avail * 0.03)))
+
+    per_read = max(256 * 1024, min(8 * 1024 * 1024, total_read_budget // w))
+    per_flush = max(1 * 1024 * 1024, min(16 * 1024 * 1024, total_flush_budget // w))
+
+    # Align to 4KiB
+    per_read = (per_read // 4096) * 4096
+    per_flush = (per_flush // 4096) * 4096
+    return int(per_read), int(per_flush)
+
+
 def write_summary_file(output_dir: Path, snapshot: dict, plan: MatchPlan, cancelled: bool) -> None:
     started = datetime.fromtimestamp(snapshot["started_at"]).isoformat(sep=" ", timespec="seconds")
     finished_at = snapshot["finished_at"] or time.time()
@@ -765,6 +904,10 @@ def write_summary_file(output_dir: Path, snapshot: dict, plan: MatchPlan, cancel
         f"started: {started}",
         f"finished: {ended}",
         f"cancelled: {'yes' if cancelled else 'no'}",
+        f"active_workers: {snapshot.get('active_workers', 0)}",
+        f"output_mode: {snapshot.get('output_mode', '')}",
+        f"file_read_buffer_bytes: {snapshot.get('file_read_buffer_bytes', 0)}",
+        f"flush_threshold_bytes: {snapshot.get('flush_threshold_bytes', 0)}",
         f"files_processed: {snapshot['processed_files']}/{snapshot['total_files']}",
         f"bytes_scanned: {snapshot['scanned_bytes']}",
         f"bytes_scanned_human: {format_bytes(snapshot['scanned_bytes'])}",
@@ -809,14 +952,55 @@ def run_scan(
     if total_files == 0:
         return stats.finish()
 
+    if workers <= 0:
+        workers = recommend_max_workers()
+
     output_dir.mkdir(parents=True, exist_ok=True)
     output_manager = OutputManager(output_dir, plan.specs)
-    active_workers = min(max(1, workers), total_files)
+    active_workers = min(max(1, int(workers)), total_files)
+
+    # Prevent "too many open files" by clamping worker count to the current process
+    # NOFILE limit, accounting for already-open output handles.
+    try:
+        import resource  # type: ignore
+
+        soft_limit, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft_limit and soft_limit > 0 and soft_limit < 1_000_000_000:
+            # Budget: output handles + input handles (workers) + margin for stdio/etc.
+            margin = 64
+            max_inputs = int(soft_limit) - int(output_manager.open_handle_count) - margin
+
+            # If pre-opening outputs would force us down to ~1-3 workers, prefer closing
+            # output handles and writing open-per-write to keep parallel reads high.
+            if output_manager.mode == "preopen" and max_inputs < min(4, active_workers):
+                output_manager.downgrade_to_open_per_write()
+                max_inputs = int(soft_limit) - int(output_manager.open_handle_count) - margin
+
+            active_workers = max(1, min(active_workers, max(1, max_inputs)))
+    except Exception:
+        pass
+
+    file_read_buffer_bytes, flush_threshold_bytes = recommend_io_buffers(active_workers)
+    stats.set_runtime_config(
+        active_workers=active_workers,
+        file_read_buffer_bytes=file_read_buffer_bytes,
+        flush_threshold_bytes=flush_threshold_bytes,
+        output_mode=output_manager.mode,
+    )
 
     try:
         with ThreadPoolExecutor(max_workers=active_workers) as executor:
             futures = {
-                executor.submit(process_file, file_path, plan, output_manager, stats, stop_event): file_path
+                executor.submit(
+                    process_file,
+                    file_path,
+                    plan,
+                    output_manager,
+                    stats,
+                    stop_event,
+                    flush_threshold_bytes=flush_threshold_bytes,
+                    file_read_buffer_bytes=file_read_buffer_bytes,
+                ): file_path
                 for file_path, _ in files
             }
             for future in as_completed(futures):

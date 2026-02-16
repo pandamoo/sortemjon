@@ -33,6 +33,7 @@ if TK_AVAILABLE:
 
             self.logs_dir_var = tk.StringVar()
             self.worker_var = tk.IntVar(value=self.default_workers())
+            self.auto_workers_var = tk.BooleanVar(value=True)
             self.status_var = tk.StringVar(value="Idle")
             self.files_var = tk.StringVar(value="Files: 0/0")
             self.bytes_var = tk.StringVar(value="Bytes: 0 B / 0 B")
@@ -59,14 +60,14 @@ if TK_AVAILABLE:
 
             self.start_btn: ttk.Button
             self.stop_btn: ttk.Button
+            self.worker_spin: ttk.Spinbox
 
             self.build_ui()
             self.after(200, self.refresh_ui)
 
         @staticmethod
         def default_workers() -> int:
-            cpu = os.cpu_count() or 4
-            return max(2, min(16, cpu))
+            return eng.recommend_max_workers()
 
         def build_ui(self) -> None:
             main = ttk.Frame(self, padding=12)
@@ -84,14 +85,22 @@ if TK_AVAILABLE:
                 row=0, column=2, padx=6, pady=6, sticky="ew"
             )
             ttk.Label(source_frame, text="Workers:").grid(row=0, column=3, padx=(20, 6), pady=6, sticky="e")
-            ttk.Spinbox(source_frame, from_=1, to=64, textvariable=self.worker_var, width=6).grid(
-                row=0, column=4, padx=6, pady=6, sticky="w"
+            self.worker_spin = ttk.Spinbox(
+                source_frame, from_=1, to=getattr(eng, "AUTO_MAX_WORKERS_CAP", 256), textvariable=self.worker_var, width=6
             )
+            self.worker_spin.grid(row=0, column=4, padx=6, pady=6, sticky="w")
+
+            ttk.Checkbutton(
+                source_frame,
+                text="Auto-max",
+                variable=self.auto_workers_var,
+                command=self.on_auto_workers_toggle,
+            ).grid(row=0, column=5, padx=(0, 6), pady=6, sticky="w")
 
             self.start_btn = ttk.Button(source_frame, text="Start Scan", command=self.start_scan)
-            self.start_btn.grid(row=0, column=5, padx=(20, 6), pady=6, sticky="ew")
+            self.start_btn.grid(row=0, column=6, padx=(20, 6), pady=6, sticky="ew")
             self.stop_btn = ttk.Button(source_frame, text="Stop", command=self.stop_scan, state="disabled")
-            self.stop_btn.grid(row=0, column=6, padx=6, pady=6, sticky="ew")
+            self.stop_btn.grid(row=0, column=7, padx=6, pady=6, sticky="ew")
 
             keywords_frame = ttk.Frame(main)
             keywords_frame.pack(fill="x", pady=(10, 0))
@@ -174,6 +183,15 @@ if TK_AVAILABLE:
             status_bar.pack(fill="x", pady=(8, 0))
             ttk.Label(status_bar, textvariable=self.status_var).pack(side="left")
 
+            self.on_auto_workers_toggle()
+
+        def on_auto_workers_toggle(self) -> None:
+            if self.auto_workers_var.get():
+                self.worker_var.set(eng.recommend_max_workers())
+                self.worker_spin.configure(state="disabled")
+            else:
+                self.worker_spin.configure(state="normal")
+
         def browse_logs_dir(self) -> None:
             selected = filedialog.askdirectory(title="Select logs directory")
             if selected:
@@ -198,7 +216,11 @@ if TK_AVAILABLE:
                 messagebox.showerror("No keywords", "No keywords were configured.")
                 return
 
-            workers = max(1, int(self.worker_var.get()))
+            if self.auto_workers_var.get():
+                workers = eng.recommend_max_workers()
+                self.worker_var.set(workers)
+            else:
+                workers = max(1, int(self.worker_var.get()))
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_dir = logs_dir / f"{eng.OUTPUT_PREFIX}{stamp}"
 
@@ -287,6 +309,7 @@ if TK_AVAILABLE:
             scanned_bytes = snapshot.get("scanned_bytes", 0)
             scanned_lines = snapshot.get("scanned_lines", 0)
             total_hits = snapshot.get("total_hits", 0)
+            active_workers = snapshot.get("active_workers", 0)
             skipped_not_saved = snapshot.get("skipped_not_saved", 0)
             skipped_local_ip = snapshot.get("skipped_local_ip", 0)
             parsed_ulp = snapshot.get("parsed_ulp_records", 0)
@@ -294,7 +317,10 @@ if TK_AVAILABLE:
             oversized = snapshot.get("skipped_oversized_lines", 0)
             elapsed = snapshot.get("elapsed_seconds", 0.000001)
 
-            self.files_var.set(f"Files: {processed_files:,}/{total_files:,}")
+            if active_workers:
+                self.files_var.set(f"Files: {processed_files:,}/{total_files:,} (workers={active_workers})")
+            else:
+                self.files_var.set(f"Files: {processed_files:,}/{total_files:,}")
             self.bytes_var.set(f"Bytes: {eng.format_bytes(scanned_bytes)} / {eng.format_bytes(total_bytes)}")
             self.lines_var.set(f"Lines: {scanned_lines:,}")
             self.hits_var.set(f"Hits: {total_hits:,}")
