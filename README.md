@@ -69,7 +69,8 @@ sudo apt-get update && sudo apt-get install -y python3-tk
    - Paths
    - Ports
    - Usernames
-3. Choose worker count (defaults to CPU-based value).
+3. Leave **Auto-max** enabled to automatically use an aggressive, hardware-based worker count
+   (CPU + available RAM) and tuned buffers. Disable it if you want to manually set workers.
 4. Click **Start Scan**.
 5. Watch live progress and per-keyword counters.
 
